@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Catering Escrow Smart Contract Tutorial</title>
+<style>
+body { font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; background: #f9f9f9; color: #111; }
+h1, h2, h3, h4 { color: #0b3d91; }
+pre { background: #eee; padding: 10px; overflow-x: auto; }
+code { font-family: monospace; color: #c7254e; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+th { background: #eee; }
+hr { border: 0; border-top: 1px solid #ccc; margin: 20px 0; }
+ul { margin: 10px 0; }
+</style>
+</head>
+<body>
+
+<h1>📘 Tutorial: Building a Catering Escrow Smart Contract on Cardano</h1>
+
+<h2>🧭 Overview</h2>
+<p>This tutorial shows how to create and compile a <strong>Catering Escrow smart contract</strong> on Cardano using <strong>Plutus V2</strong>.</p>
+<p>The contract handles <strong>payments for catering events</strong>, distributing funds to the <strong>caterer</strong> and <strong>suppliers</strong> based on the final headcount, while allowing <strong>refunds</strong> if necessary.</p>
+<p>You will:</p>
+<ol>
+<li>Define the escrow datum and actions</li>
+<li>Implement the validator logic</li>
+<li>Wrap and compile the contract</li>
+<li>Generate a <code>.plutus</code> file using Cabal</li>
+</ol>
+
+<hr>
+
+<h2>⚙️ 1. Smart Contract Structure</h2>
+<p>File: <strong>Catering.hs</strong></p>
+
+<h3>Language Extensions & Imports</h3>
+<pre><code>{-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE NoImplicitPrelude   #-}
+{-# LANGUAGE TemplateHaskell     #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE TypeApplications    #-}
+{-# LANGUAGE TypeFamilies        #-}
+{-# LANGUAGE TypeOperators       #-}
+{-# LANGUAGE DeriveGeneric       #-}
+
+module Main where
+
+import Prelude (IO, print, putStrLn)
+import qualified Prelude as H
+
+import PlutusTx
+import PlutusTx.Prelude hiding (Semigroup(..), unless, ($))
+import Plutus.V2.Ledger.Api
+    ( BuiltinData, ScriptContext(..), TxInfo(..), TxOut(..),
+      Validator, mkValidatorScript,
+      PubKeyHash, Address(..), Credential(..),
+      adaSymbol, adaToken, txOutValue, txOutAddress, txInfoOutputs )
+import Plutus.V2.Ledger.Contexts (txSignedBy)
+import qualified Plutus.V1.Ledger.Value as Value
+
+import qualified Data.ByteString.Lazy as LBS
+import qualified Data.ByteString.Short as SBS
+import Codec.Serialise (serialise)
+import Cardano.Api (writeFileTextEnvelope)
+import Cardano.Api.Shelley (PlutusScript(..), PlutusScriptV2)
+</code></pre>
+
+<hr>
+
+<h2>🧾 2. Datum & Redeemer Types</h2>
+
+<h3>Supplier</h3>
+<pre><code>data Supplier = Supplier
+    { sPkh   :: PubKeyHash
+    , sShare :: Integer  -- parts per 1000
+    }
+PlutusTx.unstableMakeIsData ''Supplier
+</code></pre>
+<p>Each supplier has a <strong>public key hash</strong> and a <strong>share of the payment</strong> in per-mille.</p>
+
+<h3>Event Escrow</h3>
+<pre><code>data EventEscrow = EventEscrow
+    { client            :: PubKeyHash
+    , caterer           :: PubKeyHash
+    , expectedHeadcount :: Integer
+    , pricePerHead      :: Integer   -- in lovelace
+    , suppliers         :: [Supplier]
+    }
+PlutusTx.unstableMakeIsData ''EventEscrow
+</code></pre>
+<p>Stores the <strong>client</strong>, <strong>caterer</strong>, <strong>expected headcount</strong>, <strong>price per head</strong>, and a <strong>list of suppliers</strong>.</p>
+
+<h3>Actions</h3>
+<pre><code>data Action = Lock | Finalize Integer | Refund
+PlutusTx.unstableMakeIsData ''Action
+</code></pre>
+<ul>
+<li><strong>Lock</strong> – lock the funds in the contract</li>
+<li><strong>Finalize n</strong> – distribute funds according to the actual headcount</li>
+<li><strong>Refund</strong> – refund the client</li>
+</ul>
+
+<hr>
+
+<h2>🧠 3. Helper Functions</h2>
+
+<h3>Address for Public Key</h3>
+<pre><code>{-# INLINABLE pubKeyHashAddress #-}
+pubKeyHashAddress :: PubKeyHash -> Address
+pubKeyHashAddress pkh = Address (PubKeyCredential pkh) Nothing
+</code></pre>
+
+<h3>Compute value paid to a PubKey</h3>
+<pre><code>{-# INLINABLE valuePaidTo #-}
+valuePaidTo :: TxInfo -> PubKeyHash -> Integer
+valuePaidTo info pkh =
+    let outs = txInfoOutputs info
+        matches = [ Value.valueOf (txOutValue o) adaSymbol adaToken
+                  | o <- outs, txOutAddress o == pubKeyHashAddress pkh ]
+    in foldr (+) 0 matches
+</code></pre>
+
+<h3>Compute supplier due</h3>
+<pre><code>{-# INLINABLE supplierDue #-}
+supplierDue :: Integer -> Supplier -> Integer
+supplierDue totalDue (Supplier _ sharePerMille) =
+    (totalDue * sharePerMille) `divide` 1000
+</code></pre>
+
+<hr>
+
+<h2>🧩 4. Core Validator Logic</h2>
+<pre><code>{-# INLINABLE mkCateringValidator #-}
+mkCateringValidator :: EventEscrow -> Action -> ScriptContext -> Bool
+mkCateringValidator datum action ctx =
+    case action of
+      Lock -> True
+      Refund -> traceIfFalse "refund: client signature required" (txSignedBy info (client datum))
+      Finalize actualHeadcount ->
+        let totalDue = actualHeadcount * pricePerHead datum
+            sDues = map (\s -> (sPkh s, supplierDue totalDue s)) (suppliers datum)
+            sumSuppliers = foldr (\(_,d) acc -> acc + d) 0 sDues
+            catererDue = totalDue - sumSuppliers
+            paidToCaterer = valuePaidTo info (caterer datum)
+            paidToSuppliersOK = foldr (\(pkh,d) acc -> acc && (valuePaidTo info pkh >= d)) True sDues
+            catererOK = paidToCaterer >= catererDue
+        in traceIfFalse "finalize: insufficient payment to caterer" catererOK
+           && traceIfFalse "finalize: insufficient payment to one or more suppliers" paidToSuppliersOK
+  where
+    info = scriptContextTxInfo ctx
+</code></pre>
+
+<p><strong>Logic:</strong></p>
+<ul>
+<li><strong>Lock</strong> – always valid</li>
+<li><strong>Refund</strong> – requires client signature</li>
+<li><strong>Finalize</strong> – checks total payment, supplier shares, and caterer payment</li>
+</ul>
+
+<hr>
+
+<h2>🔒 5. Wrap & Compile</h2>
+<pre><code>{-# INLINABLE wrapped #-}
+wrapped :: BuiltinData -> BuiltinData -> BuiltinData -> ()
+wrapped d r c =
+    let esc = unsafeFromBuiltinData d :: EventEscrow
+        act = unsafeFromBuiltinData r :: Action
+        ctx = unsafeFromBuiltinData c :: ScriptContext
+    in if mkCateringValidator esc act ctx then () else traceError "CateringEscrow: validation failed"
+
+validator :: Validator
+validator = mkValidatorScript $$(PlutusTx.compile [|| wrapped ||])
+</code></pre>
+
+<hr>
+
+<h2>💾 6. Writing the <code>.plutus</code> File</h2>
+<pre><code>saveValidator :: IO ()
+saveValidator = do
+    let scriptSerialised = serialise validator
+        scriptShortBs    = SBS.toShort (LBS.toStrict scriptSerialised)
+        plutusScript     = PlutusScriptSerialised scriptShortBs :: PlutusScript PlutusScriptV2
+    r <- writeFileTextEnvelope "catering-validator.plutus" Nothing plutusScript
+    case r of
+      Left err -> print err
+      Right () -> putStrLn "✅ Catering validator written to: catering-validator.plutus"
+
+main :: IO ()
+main = saveValidator
+</code></pre>
+
+<hr>
+
+<h2>📦 7. Cabal Executable Section</h2>
+<pre><code>executable catering-exe
+  main-is:            Catering.hs
+  hs-source-dirs:     tests
+  build-depends:
+      base >=4.14 && <5,
+      plutus-ledger-api,
+      plutus-tx,
+      plutus-tx-plugin,
+      bytestring,
+      serialise,
+      text,
+      containers,
+      cardano-api,
+      cardano-ledger-core,
+      cardano-ledger-shelley
+  default-language:   Haskell2010
+</code></pre>
+
+<hr>
+
+<h2>🧪 8. Build & Run</h2>
+<pre><code>cabal update
+cabal build catering-exe
+cabal run catering-exe
+
+-- Output:
+✅ Catering validator written to: catering-validator.plutus
+</code></pre>
+
+<hr>
+
+<h2>🧩 9. Example Scenario</h2>
+<table>
+<tr><th>Step</th><th>Action</th><th>Result</th></tr>
+<tr><td>1</td><td>Lock funds</td><td>Contract accepts ADA</td></tr>
+<tr><td>2</td><td>Refund</td><td>Only client can trigger</td></tr>
+<tr><td>3</td><td>Finalize 50 guests</td><td>Caterer & suppliers paid correctly</td></tr>
+<tr><td>4</td><td>Finalize insufficient payment</td><td>Transaction fails</td></tr>
+</table>
+
+<hr>
+
+<h2>✅ Summary</h2>
+<ul>
+<li>Built a <strong>Catering Escrow validator</strong> in Plutus V2</li>
+<li>Handles <strong>locking</strong>, <strong>finalizing payments</strong>, and <strong>refunds</strong></li>
+<li>Calculates <strong>supplier shares</strong> and ensures proper <strong>fund distribution</strong></li>
+<li>Compiles and serializes a <code>.plutus</code> file using Cabal</li>
+</ul>
+
+</body>
+</html>
